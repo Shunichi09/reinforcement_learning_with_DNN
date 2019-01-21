@@ -1,0 +1,12 @@
+*.csv
+*.log
+*.pickle
+*.mp4
+*.json
+
+.cache/
+.eggs/
+__pycache__/
+.pytest_cache
+cache/
+.Q_video_log/
