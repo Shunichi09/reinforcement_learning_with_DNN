@@ -26,6 +26,9 @@ writer = SummaryWriter(log_dir = LOG_DIR)
 from collections import namedtuple, deque # .framesとかでアクセスできるようにしてる
 import random
 
+
+device = torch.device("cuda")
+
 # 保存する用の型を作成
 Transition = namedtuple('Transition', ('frames', 'action', 'next_frames', 'reward'))
 
@@ -36,7 +39,6 @@ class Net(nn.Module):
     """
     def __init__(self, num_actions, input_channel_num=4):
         super(Net,self).__init__()
-        # input channel is 4
         # input channel is 4
         # input size = 80 * 80
         self.conv1 = nn.Conv2d(input_channel_num, 32, kernel_size=8, stride=4, padding=122)
@@ -53,6 +55,7 @@ class Net(nn.Module):
         # input size = 256
         self.fc2 = nn.Linear(256, num_actions)
         torch.nn.init.normal_(self.fc2.weight, std=0.05)
+
 
     def forward(self, x):
         # input→conv1→activation(ReLU)
@@ -81,7 +84,6 @@ class ReplayMemory():
     """
     Attributes
     -----------
-
     """
     def __init__(self, capacity):
         """
@@ -113,7 +115,6 @@ class ReplayMemory():
     def sample(self, batch_size):
         """
         take the data with random
-
         Parameters
         ----------
         batch_size : int
@@ -147,8 +148,11 @@ class DQNNet():
         self.gamma = 0.99
 
         self.model = Net(self.num_actions)
+        self.model.to(device)
+        
         # Fixed Q net
         self._teacher_model = Net(self.num_actions)
+        self._teacher_model.to(device)
 
         print(self.model) # 確認する
         input()
@@ -173,7 +177,8 @@ class DQNNet():
 
         # torch.FloatTensor of size BATCH_SIZEx4
         frames_batch = torch.cat(batch.frames) # 1 set is 4 frames
-        action_batch = torch.cat(batch.action) # action 
+        action_batch = torch.cat(batch.action) # action
+        
         reward_batch = torch.cat(batch.reward) 
         non_final_next_frames = torch.cat([s for s in batch.next_frames if s is not None])
         
@@ -182,7 +187,9 @@ class DQNNet():
         # calc => Q(s, a)
         self.model.eval()
         # first input, batchsize * (1)
-        state_action_values = self.model(frames_batch).gather(1, action_batch) # gather check the note, pick up action_num's value 
+        frames_batch = frames_batch.to(device)
+        temp_state_action_values = self.model(frames_batch)
+        state_action_values = temp_state_action_values.to('cpu').gather(1, action_batch) # gather check the note, pick up action_num's value 
 
         # calc max Q having next frames => gamma max_a Q(st+1, at+1)
         # if not done, check next_state
@@ -191,8 +198,9 @@ class DQNNet():
         next_state_values = torch.zeros(self.batch_size)        
         # max(1) => see note, return 
         # detach => pick only tensor but have same storage
-        
-        next_state_values[non_final_mask] = self._teacher_model(non_final_next_frames).max(1)[0].detach()
+        non_final_next_frames = non_final_next_frames.to(device)
+        expect_value = self._teacher_model(non_final_next_frames).to('cpu')
+        next_state_values[non_final_mask] = expect_value.max(1)[0].detach()
         # print("torch.is_storage(obj) = {}".format(torch.is_tensor(self.model(non_final_next_frames).max(1)[0])))
         # print("torch.is_storage(obj) = {}".format(torch.is_tensor(self.model(non_final_next_frames).max(1)[0].detach())))
         # input()
@@ -208,7 +216,7 @@ class DQNNet():
         # loss = F.smooth_l1_loss(state_action_values, expected_state_action_values.unsqueeze(1))
         MSE_loss = nn.MSELoss()
         loss = MSE_loss(state_action_values, expected_state_action_values.unsqueeze(1))
-
+        
         # save loss
         writer.add_scalar(tag='loss_data', scalar_value=loss.item(), global_step=self.count)
         self.count += 1
@@ -236,28 +244,30 @@ class DQNNet():
             episode num
         """
         # ε-greedy
+                
         final_epsilon = 1e-3
         initial_epsilon = 0.5
         
         if episode == 0:
           self.epsilon = 0.5
+        
         else:
           diff = (initial_epsilon - final_epsilon)
           decray = diff / episode
           self.epsilon = max(self.epsilon-decray, final_epsilon)
 
         # epsilon = 0.5 * (1 / (episode + 1))
-
         if self.epsilon <= np.random.uniform(0, 1):
             self.model.eval()  # estimated mode
             with torch.no_grad():
+                frames = frames.to(device)
                 action = self.model(frames).max(1)[1].view(1, 1) # get the index
 
         else:
             # random
             action = torch.LongTensor([[random.randrange(self.num_actions)]])  # random
 
-        return action
+        return action.to('cpu')
 
 class Agent():
     def __init__(self, num_actions):
@@ -306,7 +316,6 @@ class Agent():
         """
         Parameters
         -----------
-
         """
         self.brain.update_teacher_model()
     
@@ -354,7 +363,7 @@ class Trainer():
             
             while not done: # this game does not have end
                 if render: # 
-                    self.observer.render()
+                    # self.observer.render()
                     self.agent.save(episode)
                 
                 action = self.agent.get_action(frames, episode)  # get action
@@ -378,8 +387,8 @@ class Trainer():
                 total_reward += reward.item()
             
             else:
-                if episode % 3 == 0:
-                    self.agent.update_teacher()
+              if episode % 3 == 0:
+                self.agent.update_teacher()
 
             # save loss
             writer.add_scalar(tag='reward', scalar_value=total_reward, global_step=episode)
@@ -477,7 +486,7 @@ def main():
     """
     """
     env = gym.make('Catcher-v0')
-    video_path = "./DQN_video"
+    video_path = "./DQN_video" # google driveのpathは階層構造ではない
     env = wrappers.Monitor(env, video_path, video_callable=(lambda ep: ep % 100 == 0), force=True)
 
     observer = Observer(env, 80, 80, 4)

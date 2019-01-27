@@ -16,4 +16,6 @@ add scalar
 
 # 表示の仕方
 
+```
 tensorboard --logdir=./log
+```

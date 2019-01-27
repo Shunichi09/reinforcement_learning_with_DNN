@@ -105,7 +105,33 @@ load
 ```
 the_model = TheModelClass(*args, **kwargs)
 the_model.load_state_dict(torch.load(PATH))
-````
+```
+
+# 重み初期化
+
+```
+self.conv1 = nn.Conv2d(input_channel_num, 32, kernel_size=8, stride=4, padding=122)
+torch.nn.init.normal_(self.conv1.weight, std=0.05)
+```
+
+こんな感じで初期化可能
+
+# gpuについて
+
+
+```
+device = torch.device("cuda")
+
+self.model.to(device)
+
+.to('cpu')
+```
+
+基本的にはエラーが出てくれるから大丈夫だが
+
+入力、出力はGPUになってるのでこっちで宣言したもの使いたい場合は元に戻さないといけない
+もしすべてGPUにしたいならそれでも可な気がする
+そこはどっちでもいいんだと思う
 
 # 性質
 
