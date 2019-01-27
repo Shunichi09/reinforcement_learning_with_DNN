@@ -13,3 +13,7 @@
 add scalar
 とか
 そのへん使いながらといった感じでしょうか
+
+# 表示の仕方
+
+tensorboard --logdir=./log

@@ -10,12 +10,19 @@ import torch.nn.functional as F
 from torch.autograd import Variable
 
 from tensorboardX import SummaryWriter
+
+from PIL import Image
+
 import os
 
 LOG_DIR = os.path.join(os.path.dirname(__file__), 'log') # これでtensorboard
+file_names = os.listdir(LOG_DIR)
+for file_name in file_names: # logファイルが残っていたら消去
+    os.remove(LOG_DIR + '/' + file_name)
+
 writer = SummaryWriter(log_dir = LOG_DIR)
 
-from collections import namedtuple # .framesとかでアクセスできるようにしてる
+from collections import namedtuple, deque # .framesとかでアクセスできるようにしてる
 import random
 
 # 保存する用の型を作成
@@ -59,8 +66,8 @@ class Net(nn.Module):
 
 # to add the model to tensorboard
 # tensor
-dummy_x = Variable(torch.rand(13, 1, 80, 80))
-test_model = Net(4)
+dummy_x = Variable(torch.rand(15, 4, 80, 80))
+test_model = Net(3)
 writer.add_graph(test_model, (dummy_x, ))
 
 class ReplayMemory():
@@ -76,20 +83,34 @@ class ReplayMemory():
         self.memory = [] # transition 
         self.index = 0
 
-    def push(self, frames, action, next_frames, end_flg):
+    def push(self, frames, action, next_frames, reward):
         """save the transition to memory
+        Parameters
+        ------------
+        frames : torch.tensor, shape(1 * 4 * 80 * 80)
+            the game frame
+        action : int
+            action number
+        next_frames : torch.tensor, shape(1 * 4 * 80 * 80)
+            the game frame
+        reward : float
         """
 
         if len(self.memory) < self.capacity: # should save
             self.memory.append(None)
         
-        self.memory[self.index] = Transition(frames, action, next_frames, end_flg)
+        self.memory[self.index] = Transition(frames, action, next_frames, reward)
 
         self.index = (self.index + 1) % self.capacity # index_num start from 0 to self.capacity
 
     def sample(self, batch_size):
         """
-        take the data with random 
+        take the data with random
+
+        Parameters
+        ----------
+        batch_size : int
+            batch size of input data
         """
         return random.sample(self.memory, batch_size)
 
@@ -103,7 +124,7 @@ class ReplayMemory():
 class DQNNet():
     """
     """
-    def __init__(self, num_states, num_actions):
+    def __init__(self, num_actions):
         """
         """
         self.num_actions = num_actions # アクションの数、これは環境で得れる
@@ -119,6 +140,8 @@ class DQNNet():
         self.gamma = 0.99
 
         self.model = Net(self.num_actions)
+        # Fixed Q net
+        self._teacher_model = Net(self.num_actions)
 
         print(self.model) # 確認する
         input()
@@ -137,47 +160,47 @@ class DQNNet():
         
         transitions = self.memory.sample(self.batch_size) # make mini batch
 
-        batch = Transition(*zip(*transitions)) # *zipで、tuple方向の変更、*listで取り出し
+        # We have
+        # Transition * Batchsize
+        batch = Transition(*zip(*transitions)) # *zipで、tuple方向の変更、*listで取り出し, turn into [torch.FloatTensor of size 80 * 80 * 4] * BATCH_SIZE, have the name
 
-        # 例えばstateの場合、[torch.FloatTensor of size 1x4]がBATCH_SIZE分並んでいるのですが、
-        # それを torch.FloatTensor of size BATCH_SIZEx4 に変換
-        # 状態(frames) = before 4 frames, action, reward, non_finalの状態のミニバッチのVariableを作成
-
+        # torch.FloatTensor of size BATCH_SIZEx4
         frames_batch = torch.cat(batch.frames) # 1 set is 4 frames
         action_batch = torch.cat(batch.action) # action 
         reward_batch = torch.cat(batch.reward) 
         non_final_next_frames = torch.cat([s for s in batch.next_frames if s is not None])
         
-        # estimate mode, Q[s, a] = Q[s, a] + alpha[R + gamma max_a Q(st+1, a) - Q(s, a)]
-        # calc, Q(s+1, a)
+        # estimate mode, Q[s, a] <= Q[s, a] + alpha[R + gamma max_a Q(st+1, at+1) - Q(s, a)]
+        
+        # calc => Q(s, a)
         self.model.eval()
-
         # first input, batchsize * (1)
-        state_action_values = self.model(state_batch).gather(1, action_batch) # gather check the note, pick up action_num's value 
+        state_action_values = self.model(frames_batch).gather(1, action_batch) # gather check the note, pick up action_num's value 
 
+        # calc max Q having next frames => gamma max_a Q(st+1, at+1)
         # if not done, check next_state
-        non_final_mask = torch.ByteTensor(tuple(map(lambda s: s is not None, batch.next_state)))
+        non_final_mask = torch.ByteTensor(tuple(map(lambda s: s is not None, batch.next_frames)))
         # first all 0
-        next_state_values = torch.zeros(self.batch_size)
+        next_state_values = torch.zeros(self.batch_size)        
+        # max(1) => see note, return 
+        # detach => pick only tensor but have same storage
+        
+        next_state_values[non_final_mask] = self._teacher_model(non_final_next_frames).max(1)[0].detach()
+        # print("torch.is_storage(obj) = {}".format(torch.is_tensor(self.model(non_final_next_frames).max(1)[0])))
+        # print("torch.is_storage(obj) = {}".format(torch.is_tensor(self.model(non_final_next_frames).max(1)[0].detach())))
+        # input()
 
-        # 次の状態があるindexの最大Q値を求める
-        # 出力にアクセスし、max(1)で列方向の最大値の[値、index]を求めます
-        # そしてそのQ値（index=0）を出力します
-        # detachでその値を取り出します
-        next_state_values[non_final_mask] = self.model(non_final_next_states).max(1)[0].detach() # ちがった、とりあえずこれでストレージを共有して、tensorだけ取り出してるイメージ
         # calc expected Q(st, at)
         expected_state_action_values = reward_batch + self.gamma * next_state_values
-
+        
         # training mode
         self.model.train()
 
-        # 損失関数：smooth_l1_lossはHuberloss
-        # expected_state_action_valuesは
-        # sizeが[minbatch]になっているので、unsqueezeで[minibatch x 1]へ　常にこの形にする
-        # unsqueezeは普通の便利関数
+        # calc loss
+        # unsqueeze => [1, 2, 3] => [[1], [2], [3]]
         loss = F.smooth_l1_loss(state_action_values, expected_state_action_values.unsqueeze(1))
         
-        # lossを保存する
+        # save loss
         writer.add_scalar(tag='loss_data', scalar_value=loss.item(), global_step=self.count)
         self.count += 1
 
@@ -185,32 +208,46 @@ class DQNNet():
         loss.backward()  # backpropagation
         self.optimizer.step()  # update
 
-    def decide_action(self, state, episode):
+    def update_teacher_model(self):
+        self._teacher_model.load_state_dict(self.model.state_dict())
+
+    def save(self, episode):
         """
-        ここ自体にはバッチサイズ的な話は入ってこない
         """
-        # ε-greedy法で徐々に最適行動を採用する
+        torch.save(self.model, "./param/cnn_{}.pkl".format(episode))
+
+    def decide_action(self, frames, episode):
+        """
+        only decide the action
+        Parameters
+        ------------
+        frames : torch.tensor, shape(1, 4, 80, 80)
+        episode : int
+            episode num
+        """
+        # ε-greedy
         epsilon = 0.5 * (1 / (episode + 1))
 
         if epsilon <= np.random.uniform(0, 1):
-            self.model.eval()  # ネットワークを推論
+            self.model.eval()  # estimated mode
             with torch.no_grad():
-                action = self.model(state).max(1)[1].view(1, 1)
-            # ネットワークの出力の最大値のindexを取り出します = max(1)[1]
-            # .view(1,1)は[torch.LongTensor of size 1]　を size 1x1 に変換します
+                action = self.model(frames).max(1)[1].view(1, 1) # get the index
 
         else:
-            # 0,1の行動をランダムに返す
-            action = torch.LongTensor([[random.randrange(self.num_actions)]])  # 0,1の行動をランダムに返す
-            # actionは[torch.LongTensor of size 1x1]の形になります
+            # random
+            action = torch.LongTensor([[random.randrange(self.num_actions)]])  # random
 
         return action
 
 class Agent():
-    def __init__(self, num_states, num_actions):
+    def __init__(self, num_actions):
         """
+        Parameters
+        -----------
+        num_states : int
+        num_actions : int
         """
-        self.brain = DQNNet(num_states, num_actions)  # brain 
+        self.brain = DQNNet(num_actions)  # brain 
 
     def update_q_function(self):
         """
@@ -218,94 +255,203 @@ class Agent():
         """
         self.brain.replay()
 
-    def get_action(self, state, episode):
+    def get_action(self, frames, episode):
         """
-        policyにのっとってアクションを取得
+        Parameters
+        ------------
+        frames : torch.tensor, shape(1 * 4 * 80 * 80)
+            the game frame
+        episode : int
+            episode number
         """
 
-        action = self.brain.decide_action(state, episode)
+        action = self.brain.decide_action(frames, episode)
         return action
 
-    def memorize(self, state, action, state_next, reward):
+    def memorize(self, frames, action, next_frames, reward):
         """
-        記憶する
+        Parameters
+        ------------
+        frames : torch.tensor, shape(1 * 4 * 80 * 80)
+            the game frame
+        action : int
+            action number
+        next_frames : torch.tensor, shape(1 * 4 * 80 * 80)
+            the game frame
+        reward : float
         """
-        self.brain.memory.push(state, action, state_next, reward)
+        self.brain.memory.push(frames, action, next_frames, reward)
 
-class Environment():
+    def update_teacher(self):
+        """
+        Parameters
+        -----------
+
+        """
+        self.brain.update_teacher_model()
+    
+    def save(self, episode):
+        """
+        """
+        self.brain.save(episode)
+
+class Trainer():
     """
+    Attributes
+    -----------
+    env : gym.enviroment
+    agent : Agent 
     """
-    def __init__(self, env):
+    def __init__(self, observer):
         """
         """
-        self.env = env  # 環境設定
-        num_states = self.env.observation_space.shape[0]  # 環境状態数
-        num_actions = self.env.action_space.n  # 環境アクション数
-        self.agent = Agent(num_states, num_actions)  # 環境内で行動するAgentを生成
+        self.observer = observer
 
-    def run(self, MAX_EPISODE=5000, MAX_STEPS=200, render=False, report_interval=50):
+        # XXX: must change
+        self.env = observer.env  # game
+        num_states = self.env.observation_space.shape[0]  # states num but in this case dont need
+        num_actions = self.env.action_space.n  # num action in this case 3
+
+        self.agent = Agent(num_actions)
+        self.agent.update_teacher() # initialize
+        self.agent.save(0)
+
+    def run(self, MAX_EPISODE=5000, render=False, report_interval=50):
+        """
+        Parameters
+        ------------
+        MAX_EPISODE : int, default is 5000
+        render : bool, default is False
+        report_interval : int, default is 50
         """
 
-        """
-
-        for episode in range(MAX_EPISODE):  # 最大試行数分繰り返す
+        for episode in range(MAX_EPISODE):
             print("episode {}".format(episode))
-            observation = self.env.reset()  # 環境の初期化
 
-            state = observation  # 観測をそのまま状態sとして使用
-            state = torch.from_numpy(state).type(torch.FloatTensor)  # NumPyをPyTorchのテンソルに変換
-            state = torch.unsqueeze(state, 0)  # size 4をsize 1x4に変換
-
-            for step in range(MAX_STEPS):  # 1エピソードのループ、最大は事前にわかる
-                if render: # 描画かどうかの確認
-                    self.env.render()
-
-                action = self.agent.get_action(state, episode)  # 行動を求める
-
-                # 行動a_tの実行により、s_{t+1}とdoneフラグを求める
-                # actionから.item()を指定して、中身を取り出す
-                observation_next, _, done, _ = self.env.step(action.item())  # rewardとinfoは使わないので_にする
-
-                # 報酬clippingなので、さらにepisodeの終了評価と、state_nextを設定する
-                if done:  # ステップ数が200経過のみ
-                    state_next = None  # 次の状態はないので、Noneを格納
+            frames = self.observer.init_reset()
+            done = False
+            total_reward = 0
+            
+            while not done: # this game does not have end
+                if render: # 
+                    self.observer.render()
+                    self.agent.save(episode)
                 
-                    reward = torch.FloatTensor([1.0])  # 報酬
+                action = self.agent.get_action(frames, episode)  # get action
 
-                    if step > 195:
-                        reward = torch.FloatTensor([-1.0])  # stepをマックス使い切ってたら-1
-                    else:
-                        print("reached!!")
+                # .item() => to numpy
+                next_frames, reward, done = self.observer.step(action.item())
 
-                else:
-                    reward = torch.FloatTensor([0.0])  # 普段は報酬0
-                    state_next = observation_next  # 観測をそのまま状態とする
-                    state_next = torch.from_numpy(state_next).type(torch.FloatTensor)  # numpy変数をPyTorchのテンソルに変換
-                    state_next = torch.unsqueeze(state_next, 0)  # size 4をsize 1x4に変換
+                if done:  
+                    next_frames = None  
 
-                # メモリに経験を追加
-                self.agent.memorize(state, action, state_next, reward)
+                # add memory
+                self.agent.memorize(frames, action, next_frames, reward)
 
-                # Experience ReplayでQ関数を更新する
+                # update experience replay
                 self.agent.update_q_function()
 
-                # 観測の更新
-                state = state_next
+                # update frames
+                frames = next_frames
 
-                if done:
-                    break # 終了した場合
+                # update reward
+                total_reward += reward.item()
+            
+            else:
+                self.agent.update_teacher()
 
-            # report するかどうかの確認
+            # save loss
+            writer.add_scalar(tag='reward', scalar_value=total_reward, global_step=episode)
+
+            # report if yes, render and save the path
             if episode % report_interval == 0:
                 render = True
             else : 
                 render = False
 
-    def _transform_frames():
-        """
-        """
-        
 
+class Observer():
+    """
+    """
+
+    def __init__(self, env, width, height, num_frame):
+        """
+        Parameters
+        -----------
+        env : gym environment
+        width : int
+        height : int
+        num_frame : int
+        """
+        self.env = env
+        self.width = width
+        self.height = height
+        self.num_frame = num_frame
+        self._frames = None
+
+    def init_reset(self):
+        """
+        initial reset, when the episode starts
+        Returns
+        ----------
+        torch_frames : torch.tensor
+        """
+        self._frames = deque(maxlen=self.num_frame)
+        frame = self.env.reset()
+        torch_frames = self._transform(frame)
+
+        return torch_frames
+
+    def step(self, action):
+        """
+        Parameters
+        ------------
+        action : int
+        Returns
+        ----------
+        torch_frames : torch.tensor
+        reward : torch.tensor
+        done : bool
+        """
+        next_frame, reward, done, _ = self.env.step(action)
+        reward = torch.FloatTensor([reward])  # reward
+        torch_frames = self._transform(next_frame)
+
+        return torch_frames, reward, done
+    
+    def render(self):
+        """
+        """
+        self.env.render()
+
+    def _transform(self, frame):
+        """
+        Parameters
+        -------------
+        frame : numpy.ndarray
+        """
+        grayed = Image.fromarray(frame).convert("L") # to gray
+
+        resized = grayed.resize((self.width, self.height))
+        resized = np.array(resized).astype("float")
+        normalized = resized / 255.0  # scale to 0~1
+
+        if len(self._frames) == 0:
+            for _ in range(self.num_frame):
+                self._frames.append(normalized)
+        else:
+            self._frames.append(normalized)
+
+        np_frames = np.array(self._frames)
+
+        torch_frames = torch.from_numpy(np_frames).type(torch.FloatTensor)  # numpy => torch.tensor
+        # print("torch_size = {}".format(torch_frames.size()))
+        torch_frames = torch_frames.view(1, self.num_frame, self.width, self.height)
+        # print("torch_size = {}".format(torch_frames.size()))
+        # input()
+
+        return torch_frames
+        
 def main():
     """
     """
@@ -313,8 +459,9 @@ def main():
     video_path = "./DQN_video"
     env = wrappers.Monitor(env, video_path, video_callable=(lambda ep: ep % 100 == 0), force=True)
 
-    moutain_car = Environment(env)
-    moutain_car.run()
+    observer = Observer(env, 80, 80, 4)
+    trainer = Trainer(observer)
+    trainer.run()
 
     writer.close()
 

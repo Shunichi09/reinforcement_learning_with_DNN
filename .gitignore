@@ -1,8 +1,10 @@
 *.csv
 *.log
 *.pickle
+*.pkl
 *.mp4
 *.json
+*.shunichi
 
 .cache/
 .eggs/
@@ -11,3 +13,4 @@ __pycache__/
 cache/
 .Q_video_log/
 .log/
+.param/
