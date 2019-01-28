@@ -142,6 +142,7 @@ class DQNNet():
 
         # バッチサイズ
         self.batch_size = 32
+        self.init_memory_size = 200
 
         # 学習率
         self.gamma = 0.99
@@ -156,15 +157,21 @@ class DQNNet():
         # tensorboard用
         self.count = 1
 
+        # policy用
+        self.ready_batch = False
+        self.epsilon = 0.5
+
         # 最適化手法
         self.optimizer = optim.Adam(self.model.parameters(), lr=0.0001)
 
     def replay(self):
         """
         """
-        if len(self.memory) < self.batch_size :# memory check
+        if len(self.memory) < self.init_memory_size :# memory check
             return
         
+        self.ready_batch = True
+
         transitions = self.memory.sample(self.batch_size) # make mini batch
 
         # We have
@@ -191,7 +198,7 @@ class DQNNet():
         next_state_values = torch.zeros(self.batch_size)        
         # max(1) => see note, return 
         # detach => pick only tensor but have same storage
-        
+        self._teacher_model.eval()
         next_state_values[non_final_mask] = self._teacher_model(non_final_next_frames).max(1)[0].detach()
         # print("torch.is_storage(obj) = {}".format(torch.is_tensor(self.model(non_final_next_frames).max(1)[0])))
         # print("torch.is_storage(obj) = {}".format(torch.is_tensor(self.model(non_final_next_frames).max(1)[0].detach())))
@@ -206,9 +213,9 @@ class DQNNet():
         # calc loss
         # unsqueeze => [1, 2, 3] => [[1], [2], [3]]
         # loss = F.smooth_l1_loss(state_action_values, expected_state_action_values.unsqueeze(1))
-        MSE_loss = nn.MSELoss()
-        loss = MSE_loss(state_action_values, expected_state_action_values.unsqueeze(1))
-
+        criterion = nn.MSELoss()
+        loss = criterion(state_action_values, expected_state_action_values.unsqueeze(1))
+        print("loss = {}".format(loss))
         # save loss
         writer.add_scalar(tag='loss_data', scalar_value=loss.item(), global_step=self.count)
         self.count += 1
@@ -219,6 +226,7 @@ class DQNNet():
         self.optimizer.step()  # update
 
     def update_teacher_model(self):
+        print("update teacher")
         self._teacher_model.load_state_dict(self.model.state_dict())
 
     def save(self, episode):
@@ -235,29 +243,35 @@ class DQNNet():
         episode : int
             episode num
         """
-        # ε-greedy
-        final_epsilon = 1e-3
-        initial_epsilon = 0.5
-        
-        if episode == 0:
-          self.epsilon = 0.5
-        else:
-          diff = (initial_epsilon - final_epsilon)
-          decray = diff / episode
-          self.epsilon = max(self.epsilon-decray, final_epsilon)
-
         # epsilon = 0.5 * (1 / (episode + 1))
 
-        if self.epsilon <= np.random.uniform(0, 1):
+        if np.random.random() < self.epsilon or not self.ready_batch:
+            # random
+            action = torch.LongTensor([[random.randrange(self.num_actions)]])  # random
+        else:
+            # arg max
             self.model.eval()  # estimated mode
             with torch.no_grad():
                 action = self.model(frames).max(1)[1].view(1, 1) # get the index
 
-        else:
-            # random
-            action = torch.LongTensor([[random.randrange(self.num_actions)]])  # random
-
         return action
+    
+    def update_epsilon(self, MAX_EPISODE):
+        """
+        Parameters
+        -----------
+        episode : int
+            episode number
+        """
+        # ε-greedy
+        print("update parameters")
+        final_epsilon = 1e-3
+        initial_epsilon = 0.5
+        
+        diff = (initial_epsilon - final_epsilon)
+        decray = diff / float(MAX_EPISODE)
+        self.epsilon = max(self.epsilon-decray, final_epsilon)
+        print("epsilon = {}".format(self.epsilon))
 
 class Agent():
     def __init__(self, num_actions):
@@ -310,6 +324,12 @@ class Agent():
         """
         self.brain.update_teacher_model()
     
+    def update_parameters(self, MAX_EPISODE):
+        """
+
+        """
+        self.brain.update_epsilon(MAX_EPISODE)
+    
     def save(self, episode):
         """
         """
@@ -336,7 +356,7 @@ class Trainer():
         self.agent.update_teacher() # initialize
         self.agent.save(0)
 
-    def run(self, MAX_EPISODE=5000, render=False, report_interval=50):
+    def run(self, MAX_EPISODE=1200, render=False, report_interval=50):
         """
         Parameters
         ------------
@@ -378,7 +398,9 @@ class Trainer():
                 total_reward += reward.item()
             
             else:
+                self.agent.update_parameters(MAX_EPISODE)
                 if episode % 3 == 0:
+                    print(episode % 3)
                     self.agent.update_teacher()
 
             # save loss
