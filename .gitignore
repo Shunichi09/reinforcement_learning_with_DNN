@@ -5,6 +5,8 @@
 *.mp4
 *.json
 *.shunichi
+*.pt
+*.pth
 
 .cache/
 .eggs/
@@ -14,3 +16,5 @@ cache/
 .Q_video_log/
 .log/
 .param/
+log/
+param/
