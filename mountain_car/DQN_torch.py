@@ -72,6 +72,7 @@ class DQNNet():
 
         # バッチサイズ
         self.batch_size = 32
+        self.init_memory_size = 200
 
         # 学習率
         self.gamma = 0.99
@@ -93,14 +94,19 @@ class DQNNet():
         # tensorboard用
         self.count = 1
 
+        self.ready_batch = False
+        self.epsilon = 0.5
+
         # 最適化手法
         self.optimizer = optim.Adam(self.model.parameters(), lr=0.0001)
 
     def replay(self):
         """
         """
-        if len(self.memory) < self.batch_size :# メモリの確認、少なかったらリターン
+        if len(self.memory) < self.init_memory_size :# メモリの確認、少なかったらリターン
             return
+
+        self.ready_batch = True
         
         transitions = self.memory.sample(self.batch_size) # ミニバッチ作成、持ってくる
         
@@ -153,8 +159,8 @@ class DQNNet():
         # expected_state_action_valuesは
         # sizeが[minbatch]になっているので、unsqueezeで[minibatch x 1]へ　常にこの形にする
         # unsqueezeは普通の便利関数
-        loss = F.smooth_l1_loss(state_action_values,
-                                expected_state_action_values.unsqueeze(1))
+        MSE_loss = nn.MSELoss()
+        loss = MSE_loss(state_action_values, expected_state_action_values.unsqueeze(1))
         
         # lossを保存する
         writer.add_scalar(tag='loss_data', scalar_value=loss.item(), global_step=self.count)
@@ -164,26 +170,38 @@ class DQNNet():
         loss.backward()  # バックプロパゲーションを計算
         self.optimizer.step()  # 結合パラメータを更新
 
-    def decide_action(self, state, episode):
+    def decide_action(self, states, episode):
         """
         ここ自体にはバッチサイズ的な話は入ってこない
         """
         # ε-greedy法で徐々に最適行動を採用する
-        epsilon = 0.5 * (1 / (episode + 1))
-
-        if epsilon <= np.random.uniform(0, 1):
-            self.model.eval()  # ネットワークを推論
-            with torch.no_grad():
-                action = self.model(state).max(1)[1].view(1, 1)
-            # ネットワークの出力の最大値のindexを取り出します = max(1)[1]
-            # .view(1,1)は[torch.LongTensor of size 1]　を size 1x1 に変換します
-
+        if np.random.random() < self.epsilon or not self.ready_batch:
+            # random
+            action = torch.LongTensor([[random.randrange(self.num_actions)]])  # random
         else:
-            # 0,1の行動をランダムに返す
-            action = torch.LongTensor([[random.randrange(self.num_actions)]])  # 0,1の行動をランダムに返す
-            # actionは[torch.LongTensor of size 1x1]の形になります
+            # arg max
+            self.model.eval()  # estimated mode
+            with torch.no_grad():
+                action = self.model(states).max(1)[1].view(1, 1) # get the index
 
         return action
+    
+    def update_epsilon(self, MAX_EPISODE):
+        """
+        Parameters
+        -----------
+        episode : int
+            episode number
+        """
+        # ε-greedy
+        print("update parameters")
+        final_epsilon = 1e-3
+        initial_epsilon = 0.5
+        
+        diff = (initial_epsilon - final_epsilon)
+        decray = diff / float(MAX_EPISODE)
+        self.epsilon = max(self.epsilon-decray, final_epsilon)
+        print("epsilon = {}".format(self.epsilon))
 
 class Agent():
     def __init__(self, num_states, num_actions):
@@ -210,6 +228,12 @@ class Agent():
         記憶する
         """
         self.brain.memory.push(state, action, state_next, reward)
+
+    def update_parameters(self, MAX_EPISODE):
+        """
+
+        """
+        self.brain.update_epsilon(MAX_EPISODE)
 
 class Environment():
     """
@@ -243,8 +267,9 @@ class Environment():
 
                 # 行動a_tの実行により、s_{t+1}とdoneフラグを求める
                 # actionから.item()を指定して、中身を取り出す
-                observation_next, _, done, _ = self.env.step(action.item())  # rewardとinfoは使わないので_にする
-
+                observation_next, reward, done, _ = self.env.step(action.item())  # rewardとinfoは使わないので_にする
+                
+                """
                 # 報酬clippingなので、さらにepisodeの終了評価と、state_nextを設定する
                 if done:  # ステップ数が200経過のみ
                     state_next = None  # 次の状態はないので、Noneを格納
@@ -261,6 +286,11 @@ class Environment():
                     state_next = observation_next  # 観測をそのまま状態とする
                     state_next = torch.from_numpy(state_next).type(torch.FloatTensor)  # numpy変数をPyTorchのテンソルに変換
                     state_next = torch.unsqueeze(state_next, 0)  # size 4をsize 1x4に変換
+                """
+                reward = torch.FloatTensor([reward])  # reward
+                state_next = observation_next  # 観測をそのまま状態とする
+                state_next = torch.from_numpy(state_next).type(torch.FloatTensor)  # numpy変数をPyTorchのテンソルに変換
+                state_next = torch.unsqueeze(state_next, 0)  # size 4をsize 1x4に変換換
 
                 # メモリに経験を追加
                 self.agent.memorize(state, action, state_next, reward)
@@ -272,6 +302,7 @@ class Environment():
                 state = state_next
 
                 if done:
+                    self.agent.update_parameters(MAX_EPISODE)
                     break # 終了した場合
 
             # report するかどうかの確認
