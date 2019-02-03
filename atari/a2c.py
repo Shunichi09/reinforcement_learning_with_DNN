@@ -66,10 +66,10 @@ class BasicCNN(nn.Module):
         layers.append(self.fc1) 
         # input size = 256
         self.actor_layer = nn.Linear(256, num_action)
-        layers.append(self.actor)
+        layers.append(self.actor_layer)
 
         self.critic_layer = nn.Linear(256, 1)
-        layers.append(self.critic)
+        layers.append(self.critic_layer)
 
         # initialize
         if weight_optional_initialization:
@@ -95,10 +95,12 @@ class BasicCNN(nn.Module):
         # input→conv2→activation(ReLU)
         x = F.relu(self.conv2(x))
         # input→conv3→activation(ReLU)
-        x = F.relu(self.conv3(x))
+        # x = F.relu(self.conv3(x))
 
         # to be flatten array , batch size * 80 * 80
         x = x.view(-1, 32 * 84 * 84)
+
+        x = F.relu(self.fc1(x))
 
         # actor
         # input→fc1→activation(ReLU)
@@ -106,7 +108,7 @@ class BasicCNN(nn.Module):
         # input→fc2→output
         critic_output = F.relu(self.critic_layer(x)) # calc value of the state
 
-        return actor_output, critic_output
+        return  critic_output, actor_output
 
     def get_action(self, x):
         """
@@ -138,7 +140,7 @@ class BasicCNN(nn.Module):
         Parameters
         -----------
         x : torch.tensor, shape(batch_size, num_channel, 84, 84) 
-        actions : torch.tensor, shape(batch_size, 1, 1) 
+        actions : torch.tensor, shape(batch_size, 1) 
         
         See Also
         ----------
@@ -178,25 +180,84 @@ class BasicNN(nn.Module):
         super(BasicNN, self).__init__() 
         self.fc1 = nn.Linear(num_state, 32) 
         self.fc2 = nn.Linear(32, 32) 
-        self.fc3 = nn.Linear(32, num_action) 
+        self.actor_layer = nn.Linear(32, num_action) # actions
+        self.critic_layer = nn.Linear(32, 1) # value 
 
     def forward(self, x):
         """
         Parameters
         -----------
-        x : torch.tensor, shape(batch_size, 1, num_states) 
+        x : torch.tensor, shape(num_process * advantage_step, 1, num_states) 
         """
         h1 = F.relu(self.fc1(x))
         h2 = F.relu(self.fc2(h1))
-        output = self.fc3(h2)
+        actor_output = self.actor_layer(h2)
+        critic_output = self.critic_layer(h2)
 
-        return output
+        return critic_output, actor_output
+
+    def get_action(self, x):
+        """
+        Parameters
+        -----------
+        x : torch.tensor, shape(num_process * advantage_step, 1, num_states)
+
+        Returns
+        ------------
+        action : torch.tensor, shape(NUM_PROCESES, 1)
+        """
+        value, actor_output = self(x)
+
+        action_probs = F.softmax(actor_output, dim=1) # each row's prob
+        action = action_probs.multinomial(num_samples=1) # get samples shape(num_process, 1)
+
+        return action
+    
+    def get_value(self, x):
+        """
+        Parameters
+        -----------
+        x : torch.tensor, shape(num_process * advantage_step, 1, state_num)
+
+        Returns
+        ---------
+        value : torch.tensor, shape(num_process * advantage_step, 1)
+        """
+
+        value, actor_output = self(x)
+
+        return value
+    
+    def evaluate_actions(self, x, actions):
+        """
+        Parameters
+        ----------
+        x : torch.tensor, shape(num_process * advantage_step, 1, state_num)
+
+        actions : torch.tensor, shape(num_process * advantage_step, 1)
+
+        Returns
+        --------
+        value : torch.tensor, shape()
+        action_log_prob : torch.tensor, shape()
+        entropy : torch.tensor, shape()
+        """
+        value, actor_output = self(x)
+
+        log_probs = F.log_softmax(actor_output, dim=1) # each row
+        action_log_probs = log_probs.gather(1, actions) # get prob
+
+        probs = F.softmax(actor_output, dim=1)  # each row's prob
+        entropy = -(log_probs * probs).sum(-1).mean() # entropy is avarage
+
+        return value, action_log_probs, entropy
 
 # to add the model to tensorboard
 # tensor
 dummy_x = Variable(torch.rand(15, 1, 4))
-test_2_model = Net(4, 2)
+test_2_model = BasicNN(4, 4)
 writer.add_graph(test_2_model, (dummy_x, ))
+
 
 class RolloutStorage():
     """ instead of Experience replay, we should create the rollout class
@@ -204,7 +265,7 @@ class RolloutStorage():
     ------------
 
     """
-    def __init__(self, num_steps, num_processes, obs_shape):
+    def __init__(self, num_steps, num_processes):
         """
         Parameters
         -----------
@@ -221,8 +282,9 @@ class RolloutStorage():
         # discount reward
         self.returns = torch.zeros(num_steps + 1, num_processes, 1)
         self.index = 0 
+        self.GAMMA = 0.99
 
-    def insert(self, current_obs, action, reward, mask):
+    def insert(self, current_obs, action, reward, mask, NUM_ADVANCED_STEP):
         """ insert the transitions to rolloutdtorage
         if you can get new one, that transition add to the front 
         Parameters
@@ -234,12 +296,13 @@ class RolloutStorage():
         reward : int
             reward
         mask : int
-            state of 
+            state of None or not None
 
         Notes
         -------
         We should calculate now states reward
         but we cannot get the reward simultaniously
+        次の状態が引数として取られてる
         """
         self.observations[self.index + 1].copy_(current_obs) 
         self.masks[self.index + 1].copy_(mask) # to avoid calc final state
@@ -258,19 +321,23 @@ class RolloutStorage():
 
     def compute_returns(self, next_value):
         """
+        calc the dicount reward with discount rate
+        Parameters
+        -----------
+        next_value : 
         """
         # calc returns (discount reward)
         # reversed range
-        self.returns[-1] = next_value # the estimated value (Montecarlo)
-        for ad_step in reversed(range(self.rewards.size(0))):
-            self.returns[ad_step] = self.returns[ad_step + 1] * GAMMA *\
-                                    self.masks[ad_step + 1] + self.rewards[ad_step]
-2
+        self.returns[-1] = next_value # the estimated value (Montecarlo) or decided value, 一番最後に代入
+        for ad_step in reversed(range(self.rewards.size(0))): # NUM_STEP, NUM_STEP - 1, ...
+            self.returns[ad_step] = self.returns[ad_step + 1] * self.GAMMA *\
+                                    self.masks[ad_step + 1] + self.rewards[ad_step] # 1つ前から算出
+
 class Brain(object):
     """
     """
 
-    def __init__(self, NN_model):
+    def __init__(self, NN_model, NUM_ADVANCED_STEP, NUM_PROCESSES):
         """
         Parameters
         ------------
@@ -279,47 +346,228 @@ class Brain(object):
         self.actor_critic_model = NN_model 
         self.optimizer = optim.Adam(self.actor_critic_model.parameters(), lr=0.01)
 
-    def update(self, rollouts):
+        self.NUM_ADVANCED_STEP = NUM_ADVANCED_STEP
+        self.NUM_PROCESSES = NUM_PROCESSES
+
+
+    def update(self, rollouts, max_grad_norm=0.5, value_loss_coef=0.5, entropy_coef=0.01):
         """
+        Parameters
+        -----------
 
         """
-        obs_shape = rollouts.observations.size()[2:]  # torch.Size([4, 84, 84])
-        num_steps = NUM_ADVANCED_STEP
-        num_processes = NUM_PROCESSES
+        
 
-        values, action_log_probs, entropy = self.actor_critic.evaluate_actions(
+        values, action_log_probs, entropy = self.actor_critic_model.evaluate_actions(
             rollouts.observations[:-1].view(-1, 4),
-            rollouts.actions.view(-1, 1))
+            rollouts.actions.view(-1, 1)) # input states, action history to NN
 
-        # 注意：各変数のサイズ
-        # rollouts.observations[:-1].view(-1, 4) torch.Size([80, 4])
-        # rollouts.actions.view(-1, 1) torch.Size([80, 1])
+        # rollouts.observations[:-1].view(-1, 4) --> torch.Size([80, 4])
+        # rollouts.actions.view(-1, 1) --> torch.Size([80, 1])
         # values torch.Size([80, 1])
         # action_log_probs torch.Size([80, 1])
         # entropy torch.Size([])
 
-        values = values.view(num_steps, num_processes, 1)  # torch.Size([5, 16, 1])
-        action_log_probs = action_log_probs.view(num_steps, num_processes, 1)
+        values = values.view(self.NUM_ADVANCED_STEP, self.NUM_PROCESSES, 1)  # torch.Size([5, 16, 1])
+        action_log_probs = action_log_probs.view(self.NUM_ADVANCED_STEP, self.NUM_PROCESSES, 1) # torch.Size([5, 16, 1])
 
-        # advantage（行動価値-状態価値）の計算
+        # calc advantage
         advantages = rollouts.returns[:-1] - values  # torch.Size([5, 16, 1])
 
-        # Criticのlossを計算
+        # calc loss of caritic (advantage**2) 
         value_loss = advantages.pow(2).mean()
 
-        # Actorのgainを計算、あとでマイナスをかけてlossにする
+        # calc actor gain, later we should multiple -1 to turn it loss
         action_gain = (action_log_probs*advantages.detach()).mean()
-        # detachしてadvantagesを定数として扱う
+        # detachしてadvantagesを定数として扱う --> これ自体は更新には必要ないので定数へ
 
-        # 誤差関数の総和
-        total_loss = (value_loss * value_loss_coef -
-                      action_gain - entropy * entropy_coef)
+        # total loss
+        total_loss = (value_loss * value_loss_coef - action_gain - entropy * entropy_coef)
 
-        # 結合パラメータを更新
-        self.actor_critic.train()  # 訓練モードに
-        self.optimizer.zero_grad()  # 勾配をリセット
-        total_loss.backward()  # バックプロパゲーションを計算
-        nn.utils.clip_grad_norm_(self.actor_critic.parameters(), max_grad_norm)
-        #  一気に結合パラメータが変化しすぎないように、勾配の大きさは最大0.5までにする
+        # update
+        self.actor_critic_model.train()  
+        self.optimizer.zero_grad() # initialize  
+        total_loss.backward()
+        nn.utils.clip_grad_norm_(self.actor_critic_model.parameters(), max_grad_norm)
+        self.optimizer.step() 
 
-        self.optimizer.step()  # 結合パラメータを更新
+class Trainer():
+    """
+    Attributes
+    ------------
+
+
+    """
+    def __init__(self):
+        self.ENV = 'CartPole-v0'
+        self.NUM_PROCESSES = 16
+        self.NUM_ADVANCED_STEP = 5
+        
+
+    def train(self, NUM_EPISODES=250, check_learning_interval=3):
+        """
+        
+        """
+
+        # make environment
+        envs = [gym.make(self.ENV) for i in range(self.NUM_PROCESSES)]
+        test_env = gym.make(self.ENV)
+        video_path = "./a2c_video"
+        test_env = wrappers.Monitor(test_env, video_path, force=True)
+        # envs[0] = test_env
+
+        # make environment
+        num_state = envs[0].observation_space.shape[0]  # state num 4
+        num_action = envs[0].action_space.n  # action num 2
+        actor_critic_model = BasicNN(num_action, num_state)  # make NN
+        global_brain = Brain(actor_critic_model, self.NUM_ADVANCED_STEP, self.NUM_PROCESSES)
+
+        # make variables
+        current_states = torch.zeros(self.NUM_PROCESSES, num_state)  # torch.Size([16, 4])
+        rollouts = RolloutStorage(self.NUM_ADVANCED_STEP, self.NUM_PROCESSES)  # rollouts
+
+        episode_rewards = torch.zeros([self.NUM_PROCESSES, 1])
+        final_rewards = torch.zeros([self.NUM_PROCESSES, 1]) 
+        states_np = np.zeros([self.NUM_PROCESSES, num_state])
+        rewards_np = np.zeros([self.NUM_PROCESSES, 1])  
+        dones_np = np.zeros([self.NUM_PROCESSES, 1])  
+        each_step = np.zeros(self.NUM_PROCESSES)
+        episode = 0
+
+        # initialize, reset returns state
+        states = [envs[i].reset() for i in range(self.NUM_PROCESSES)]
+        states = np.array(states)
+        states = torch.from_numpy(states).float()  # torch.Size([16, 4])
+        current_states = states  # current state
+
+        # initialize rollouts
+        rollouts.observations[0].copy_(current_states)
+
+        # 実行ループ
+        for j in range(NUM_EPISODES * self.NUM_PROCESSES):
+            # Advantege TD(5)
+            for step in range(self.NUM_ADVANCED_STEP):
+
+                # decide action
+                with torch.no_grad(): 
+                    actions = actor_critic_model.get_action(rollouts.observations[step])
+
+                # (16,1)→(16,)→tensor-->numpy
+                actions_np = actions.squeeze(1).numpy()
+
+                # execute onestep for each process
+                for i in range(self.NUM_PROCESSES):
+                    states_np[i], rewards_np[i], dones_np[i], _ = envs[i].step(actions_np[i])
+
+                    ## reward clipping
+                    # episodeの終了評価と、state_nextを設定
+                    if dones_np[i]:  # ステップ数が200経過するか、一定角度以上傾くとdoneはtrueになる
+
+                        # 環境0のときのみ出力
+                        if i == 0:
+                            print('%d Episode: Finished after %d steps' % (
+                                episode, each_step[i]+1))
+                            episode += 1
+
+                        # set reward
+                        if each_step[i] < 195:
+                            rewards_np[i] = -1.0  # stands get reward
+                        else:
+                            rewards_np[i] = 1.0  # if not statnds
+
+                        each_step[i] = 0 # step reset
+
+                        # instead of finish state, we add new states
+                        states_np[i] = envs[i].reset() # env reset, new episode
+
+                    else:
+                        rewards_np[i] = 0.0  # usually reward is 0
+                        each_step[i] += 1
+
+                # reward --> tensor, shape(num_rocess, 1)
+                rewards = torch.from_numpy(rewards_np).float()
+                episode_rewards += rewards
+
+                # 各実行環境それぞれについて、doneならmaskは0に、継続中ならmaskは1にする
+                masks = torch.FloatTensor([[0.0] if done_ else [1.0] for done_ in dones_np])
+
+                # 最後の試行の総報酬を更新する
+                final_rewards *= masks  # 継続中の場合は1をかけ算してそのまま、done時には0を掛けてリセット
+                # 継続中は0を足す、done時にはepisode_rewardsを足す
+                final_rewards += (1 - masks) * episode_rewards
+
+                # 試行の総報酬を更新する
+                episode_rewards *= masks  # 継続中のmaskは1なのでそのまま、doneの場合は0に
+
+                # all zero if current states are done
+                current_states *= masks
+
+                # update current_states 
+                states = torch.from_numpy(states_np).float()  # torch.Size([16, 4])
+                current_states = states  # current state
+
+                # memorize
+                rollouts.insert(current_states, actions.detach(), rewards, masks, self.NUM_ADVANCED_STEP)
+
+            # advanced loop end
+
+            # calc now state's value
+            with torch.no_grad():
+                next_value = actor_critic_model.get_value(rollouts.observations[-1]).detach()
+                # rollouts.observationsのサイズはtorch.Size([6, 16, 4])
+
+            # calc discount reward
+            rollouts.compute_returns(next_value)
+
+            # NN update
+            global_brain.update(rollouts)
+
+            # reset rollout
+            rollouts.after_update()
+
+            # add tensorflow
+            writer.add_scalar(tag='total_reward', scalar_value=final_rewards.sum().item(), global_step=j)
+
+
+        for _ in range(100):
+            init_state = test_env.reset()
+            state = torch.from_numpy(init_state).float()  # torch.Size([16, 4])
+            state = state.view(1, 4)
+            done = False
+            test_reward = 0
+
+            while not done:
+                test_env.render()
+                # decide action
+                with torch.no_grad():
+                    action_tensor = actor_critic_model.get_action(state)
+
+                # (1,1)→(1,)→tensor-->numpy
+                action = action_tensor.squeeze(1).numpy()[0]
+                # action
+                next_state, reward, done, _ = test_env.step(action)
+
+                test_reward += reward
+
+                next_state = torch.from_numpy(next_state).float()
+                state = next_state.view(1, 4)
+                print("state = {}".format(state))
+                print("action = {}".format(action))
+
+            # print(test_reward)
+            writer.add_scalar(tag='test_reward', scalar_value=test_reward)
+
+def main():
+    
+    trainer = Trainer()
+    trainer.train()
+
+    writer.close()
+
+if __name__ == "__main__":
+    main()
+
+                    
+
+
+                
