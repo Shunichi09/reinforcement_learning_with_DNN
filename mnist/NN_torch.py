@@ -107,10 +107,10 @@ def main():
             outputs = model(data)
 
             # 推論
-            _, predicted = torch.max(outputs.data, 1) # バッチだから何次元目かの話
+            _, predicted = torch.max(outputs.data, 1) # max, argmax
 
-            correct += predicted.eq(targets.data.view_as(predicted)).sum() # 正解と一緒かどうか
-    
+            correct += predicted.eq(targets.data.view_as(predicted)).sum() # compare the data
+
     data_num = len(loader_test.dataset)
     print("correct = {}".format(correct.item()/float(data_num)))
 
