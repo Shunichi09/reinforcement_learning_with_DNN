@@ -27,6 +27,7 @@ def load_data():
     Y_train = torch.LongTensor(Y_train) # ラベル、整数だから変える
     Y_test = torch.LongTensor(Y_test)
 
+
     dataset_train = TensorDataset(X_train, Y_train)
     dataset_test = TensorDataset(X_test, Y_test) # tensorのデータ・セットになってる
 
